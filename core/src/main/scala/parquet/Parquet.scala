@@ -1,0 +1,923 @@
+package parquet
+
+import java.io.{ByteArrayOutputStream, InputStream, OutputStream}
+import java.nio.{ByteBuffer, ByteOrder}
+import java.nio.channels.{Channels, SeekableByteChannel}
+import scala.collection.mutable.ArrayBuilder
+import io.airlift.compress.snappy.{SnappyCompressor, SnappyDecompressor}
+import io.airlift.compress.zstd.ZstdDecompressor
+import ParquetReader.*
+
+private[parquet] final class Compact {
+  private val buf = new ByteArrayOutputStream()
+  def bytes: Array[Byte] = buf.toByteArray
+  def size: Int = buf.size
+
+  def writeByte(b: Int): Unit = buf.write(b & 0xff)
+  def writeRaw(a: Array[Byte]): Unit = buf.write(a, 0, a.length)
+
+  def writeVarint(v: Long): Unit = {
+    var x = v
+    while ((x & ~0x7fL) != 0L) {
+      writeByte(((x & 0x7f) | 0x80).toInt)
+      x >>>= 7
+    }
+    writeByte((x & 0x7f).toInt)
+  }
+
+  def zz64(n: Long): Long = (n << 1) ^ (n >> 63)
+  def zz32(n: Int): Long = (((n << 1) ^ (n >> 31)).toLong) & 0xffffffffL
+
+  val T_I32 = 5
+  val T_I64 = 6
+  val T_DOUBLE = 7
+  val T_BINARY = 8
+  val T_LIST = 9
+  val T_STRUCT = 12
+
+  def field(id: Int, ctype: Int): Unit = {
+    writeByte(ctype); writeVarint(zz64(id.toLong))
+  }
+  def i32(id: Int, v: Int): Unit = { field(id, T_I32); writeVarint(zz32(v)) }
+  def i64(id: Int, v: Long): Unit = { field(id, T_I64); writeVarint(zz64(v)) }
+  def binary(id: Int, v: Array[Byte]): Unit = {
+    field(id, T_BINARY); writeVarint(v.length.toLong); writeRaw(v)
+  }
+  def str(id: Int, s: String): Unit = binary(id, s.getBytes("UTF-8"))
+  def structField(id: Int)(body: Compact => Unit): Unit = {
+    field(id, T_STRUCT); body(this); stop()
+  }
+  def listBegin(id: Int, size: Int, elemType: Int): Unit = {
+    field(id, T_LIST)
+    if (size <= 14) writeByte((size << 4) | elemType)
+    else { writeByte(0xf0 | elemType); writeVarint(size.toLong) }
+  }
+  def elemI32(v: Int): Unit = writeVarint(zz32(v))
+  def elemStr(s: String): Unit = {
+    val b = s.getBytes("UTF-8"); writeVarint(b.length.toLong); writeRaw(b)
+  }
+  def elemStruct(body: Compact => Unit): Unit = { body(this); stop() }
+  def stop(): Unit = writeByte(0)
+}
+
+private[parquet] final class CReader(val data: Array[Byte]) {
+  var pos = 0
+  def u8(): Int = { val b = data(pos) & 0xff; pos += 1; b }
+  def readVarint(): Long = {
+    var shift = 0; var result = 0L; var cont = true
+    while (cont) {
+      val b = u8()
+      result |= (b & 0x7fL) << shift
+      if ((b & 0x80) == 0) cont = false else shift += 7
+    }
+    result
+  }
+  def zzDecode(v: Long): Long = (v >>> 1) ^ -(v & 1L)
+  def readI32(): Int = zzDecode(readVarint()).toInt
+  def readI64(): Long = zzDecode(readVarint())
+  def readBinary(): Array[Byte] = {
+    val len = readVarint().toInt
+    val a = java.util.Arrays.copyOfRange(data, pos, pos + len); pos += len; a
+  }
+  def le32At(p: Int): Int =
+    (data(p) & 0xff) | ((data(p + 1) & 0xff) << 8) | ((data(p + 2) & 0xff) << 16) | ((data(p + 3) & 0xff) << 24)
+
+  def fieldHeader(lastId: Int): (Int, Int) = {
+    val b = u8()
+    if (b == 0) (0, 0)
+    else {
+      val t = b & 0x0f
+      val delta = (b & 0xf0) >>> 4
+      val id = if (delta != 0) lastId + delta else zzDecode(readVarint()).toInt
+      (t, id)
+    }
+  }
+  def listHeader(): (Int, Int) = {
+    val b = u8()
+    val et = b & 0x0f
+    val szHi = (b & 0xf0) >>> 4
+    val sz = if (szHi == 0x0f) readVarint().toInt else szHi
+    (sz, et)
+  }
+  def skip(t: Int): Unit = t match {
+    case 1 | 2     => ()
+    case 3         => pos += 1
+    case 4 | 5 | 6 => readVarint(); ()
+    case 7         => pos += 8
+    case 8         => val l = readVarint().toInt; pos += l
+    case 9 | 10 =>
+      val (sz, et) = listHeader(); var i = 0; while (i < sz) { skip(et); i += 1 }
+    case 12 => skipStruct()
+    case other =>
+      throw new RuntimeException(s"cannot skip compact type $other")
+  }
+  def skipStruct(): Unit = {
+    var last = 0; var done = false
+    while (!done) {
+      val (t, id) = fieldHeader(last)
+      if (t == 0) done = true else { last = id; skip(t) }
+    }
+  }
+}
+
+private[parquet] final class SReader(in: InputStream) {
+  def u8(): Int = {
+    val b = in.read()
+    if (b < 0) throw new RuntimeException("unexpected end of parquet page stream")
+    b
+  }
+  def readVarint(): Long = {
+    var shift = 0; var result = 0L; var cont = true
+    while (cont) {
+      val b = u8()
+      result |= (b & 0x7fL) << shift
+      if ((b & 0x80) == 0) cont = false else shift += 7
+    }
+    result
+  }
+  def zzDecode(v: Long): Long = (v >>> 1) ^ -(v & 1L)
+  def readI32(): Int = zzDecode(readVarint()).toInt
+  def fieldHeader(lastId: Int): (Int, Int) = {
+    val b = u8()
+    if (b == 0) (0, 0)
+    else {
+      val t = b & 0x0f
+      val delta = (b & 0xf0) >>> 4
+      val id = if (delta != 0) lastId + delta else zzDecode(readVarint()).toInt
+      (t, id)
+    }
+  }
+  def listHeader(): (Int, Int) = {
+    val b = u8()
+    val et = b & 0x0f
+    val szHi = (b & 0xf0) >>> 4
+    val sz = if (szHi == 0x0f) readVarint().toInt else szHi
+    (sz, et)
+  }
+  def skipN(n: Int): Unit = {
+    var r = n
+    while (r > 0) {
+      val s = in.skip(r.toLong)
+      if (s <= 0) { if (in.read() < 0) throw new RuntimeException("unexpected end of parquet page stream"); r -= 1 }
+      else r -= s.toInt
+    }
+  }
+  def skip(t: Int): Unit = t match {
+    case 1 | 2     => ()
+    case 3         => skipN(1)
+    case 4 | 5 | 6 => readVarint(); ()
+    case 7         => skipN(8)
+    case 8         => val l = readVarint().toInt; skipN(l)
+    case 9 | 10 =>
+      val (sz, et) = listHeader(); var i = 0; while (i < sz) { skip(et); i += 1 }
+    case 12 => skipStruct()
+    case other =>
+      throw new RuntimeException(s"cannot skip compact type $other")
+  }
+  def skipStruct(): Unit = {
+    var last = 0; var done = false
+    while (!done) {
+      val (t, id) = fieldHeader(last)
+      if (t == 0) done = true else { last = id; skip(t) }
+    }
+  }
+  def readFully(n: Int): Array[Byte] = {
+    val a = in.readNBytes(n)
+    if (a.length != n)
+      throw new RuntimeException("unexpected end of parquet page stream")
+    a
+  }
+}
+
+private[parquet] final class PageHeader(
+    var pType: Int,
+    var ups: Int,
+    var cps: Int,
+    var dpNum: Int,
+    var dpEnc: Int,
+    var dictNum: Int
+)
+
+private[parquet] final class NestedChunk(
+    val reps: Array[Int],
+    val defs: Array[Int],
+    val values: ReadColumn
+)
+
+object Parquet extends ParquetReader {
+
+  private[parquet] val REP_REQUIRED = 0
+  private[parquet] val REP_OPTIONAL = 1
+  private[parquet] val REP_REPEATED = 2
+
+  private val ENC_PLAIN = 0
+  private val ENC_RLE = 3
+  private val ENC_PLAIN_DICTIONARY = 2
+  private val ENC_RLE_DICTIONARY = 8
+
+  private val PAGE_DATA = 0
+  private val PAGE_DICTIONARY = 2
+  private val MAGIC = "PAR1".getBytes("US-ASCII")
+
+  private def snappyCompress(in: Array[Byte]): Array[Byte] = {
+    val c = new SnappyCompressor()
+    val out = new Array[Byte](c.maxCompressedLength(in.length))
+    val w = c.compress(in, 0, in.length, out, 0, out.length)
+    java.util.Arrays.copyOf(out, w)
+  }
+  private def snappyDecompress(in: Array[Byte], uncompressedLen: Int): Array[Byte] = {
+    val out = new Array[Byte](uncompressedLen)
+    new SnappyDecompressor().decompress(in, 0, in.length, out, 0, uncompressedLen)
+    out
+  }
+
+  private def le32(v: Int): Array[Byte] =
+    ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(v).array()
+
+  def plainI32(d: Array[Int]): Array[Byte] = {
+    val bb = ByteBuffer.allocate(d.length * 4).order(ByteOrder.LITTLE_ENDIAN)
+    var i = 0; while (i < d.length) { bb.putInt(d(i)); i += 1 }; bb.array()
+  }
+  def plainI64(d: Array[Long]): Array[Byte] = {
+    val bb = ByteBuffer.allocate(d.length * 8).order(ByteOrder.LITTLE_ENDIAN)
+    var i = 0; while (i < d.length) { bb.putLong(d(i)); i += 1 }; bb.array()
+  }
+  def plainF64(d: Array[Double]): Array[Byte] = {
+    val bb = ByteBuffer.allocate(d.length * 8).order(ByteOrder.LITTLE_ENDIAN)
+    var i = 0; while (i < d.length) { bb.putDouble(d(i)); i += 1 }; bb.array()
+  }
+  def plainBytes(d: Array[Array[Byte]]): Array[Byte] = {
+    val out = new ByteArrayOutputStream()
+    var i = 0
+    while (i < d.length) { out.write(le32(d(i).length)); out.write(d(i)); i += 1 }
+    out.toByteArray
+  }
+
+  private def rleBitpackLevels1(levels: Array[Int]): Array[Byte] = {
+    val n = levels.length
+    val numGroups = (n + 7) / 8
+    val header = (numGroups.toLong << 1) | 1L
+    val packed = new Array[Byte](numGroups)
+    var i = 0
+    while (i < n) {
+      if (levels(i) != 0) packed(i / 8) = (packed(i / 8) | (1 << (i % 8))).toByte
+      i += 1
+    }
+    val hdr = new Compact(); hdr.writeVarint(header)
+    hdr.bytes ++ packed
+  }
+
+  private def columnChunkBytes(col: Column, codec: Int): (Array[Byte], Int, Int) = {
+    val body = new ByteArrayOutputStream()
+    if (col.optional) {
+      val lv = rleBitpackLevels1(col.defLevels)
+      body.write(le32(lv.length))
+      body.write(lv)
+    }
+    body.write(col.plainValues)
+    val pageBody = body.toByteArray
+    val storedBody =
+      if (codec == CODEC_SNAPPY) snappyCompress(pageBody) else pageBody
+
+    val ph = new Compact()
+    ph.i32(1, PAGE_DATA)
+    ph.i32(2, pageBody.length)
+    ph.i32(3, storedBody.length)
+    ph.structField(5) { c =>
+      c.i32(1, col.numRows)
+      c.i32(2, ENC_PLAIN)
+      c.i32(3, ENC_RLE)
+      c.i32(4, ENC_RLE)
+    }
+    ph.stop()
+    val chunk = new ByteArrayOutputStream()
+    chunk.write(ph.bytes)
+    chunk.write(storedBody)
+    val cb = chunk.toByteArray
+    (cb, ph.bytes.length + pageBody.length, cb.length)
+  }
+
+  def writeFile(out: OutputStream, cols: Seq[Column], numRows: Int, codec: Int): Unit = {
+    out.write(MAGIC)
+    var offset = MAGIC.length
+    val offsets = scala.collection.mutable.ArrayBuffer.empty[Int]
+    val chunkLens = scala.collection.mutable.ArrayBuffer.empty[Int]
+    val uncompTotals = scala.collection.mutable.ArrayBuffer.empty[Int]
+    cols.foreach { col =>
+      val (cb, unc, comp) = columnChunkBytes(col, codec)
+      offsets += offset
+      chunkLens += comp
+      uncompTotals += unc
+      out.write(cb)
+      offset += comp
+    }
+
+    val fm = new Compact()
+    fm.i32(1, 2)
+    fm.listBegin(2, cols.size + 1, fm.T_STRUCT)
+    fm.elemStruct { c => c.str(4, "schema"); c.i32(5, cols.size) }
+    cols.foreach { col =>
+      fm.elemStruct { c =>
+        c.i32(1, col.ptype)
+        c.i32(3, if (col.optional) REP_OPTIONAL else REP_REQUIRED)
+        c.str(4, col.name)
+        col.convertedType.foreach(ct => c.i32(6, ct))
+      }
+    }
+    fm.i64(3, numRows.toLong)
+    fm.listBegin(4, 1, fm.T_STRUCT)
+    fm.elemStruct { rg =>
+      rg.listBegin(1, cols.size, rg.T_STRUCT)
+      cols.zipWithIndex.foreach { case (col, i) =>
+        rg.elemStruct { cc =>
+          cc.i64(2, offsets(i).toLong)
+          cc.structField(3) { md =>
+            md.i32(1, col.ptype)
+            val encs =
+              if (col.optional) List(ENC_PLAIN, ENC_RLE) else List(ENC_PLAIN)
+            md.listBegin(2, encs.size, md.T_I32)
+            encs.foreach(md.elemI32)
+            md.listBegin(3, 1, md.T_BINARY)
+            md.elemStr(col.name)
+            md.i32(4, codec)
+            md.i64(5, numRows.toLong)
+            md.i64(6, uncompTotals(i).toLong)
+            md.i64(7, chunkLens(i).toLong)
+            md.i64(9, offsets(i).toLong)
+            val nc =
+              if (col.optional) Some((numRows - col.nonNull).toLong) else None
+            if (nc.isDefined || col.minBytes.isDefined || col.maxBytes.isDefined)
+              md.structField(12) { st =>
+                nc.foreach(c => st.i64(3, c))
+                col.maxBytes.foreach(b => st.binary(5, b))
+                col.minBytes.foreach(b => st.binary(6, b))
+              }
+          }
+        }
+      }
+      rg.i64(2, chunkLens.sum.toLong)
+      rg.i64(3, numRows.toLong)
+    }
+    fm.str(6, "parquet")
+    fm.stop()
+    val footer = fm.bytes
+    out.write(footer)
+    out.write(le32(footer.length))
+    out.write(MAGIC)
+  }
+
+  def writeFile(cols: Seq[Column], numRows: Int, codec: Int): Array[Byte] = {
+    val bos = new ByteArrayOutputStream()
+    writeFile(bos, cols, numRows, codec)
+    bos.toByteArray
+  }
+
+  private def readRleBitpack(
+      r: CReader,
+      bitWidth: Int,
+      count: Int,
+      endPos: Int
+  ): Array[Int] = {
+    val out = new Array[Int](count)
+    var produced = 0
+    val byteWidth = (bitWidth + 7) / 8
+    while (produced < count && r.pos < endPos) {
+      val header = r.readVarint().toInt
+      if ((header & 1) == 1) {
+        val numGroups = header >>> 1
+        val nbytes = numGroups * bitWidth
+        val base = r.pos
+        val total = numGroups * 8
+        var k = 0; var bitPos = 0
+        while (k < total && produced < count) {
+          var v = 0; var b = 0
+          while (b < bitWidth) {
+            val bit = (r.data(base + (bitPos >> 3)) >> (bitPos & 7)) & 1
+            v |= (bit << b); bitPos += 1; b += 1
+          }
+          out(produced) = v; produced += 1; k += 1
+        }
+        r.pos = base + nbytes
+      } else {
+        val repeat = header >>> 1
+        var v = 0; var i = 0
+        while (i < byteWidth) {
+          v |= (r.data(r.pos) & 0xff) << (8 * i); r.pos += 1; i += 1
+        }
+        var k = 0
+        while (k < repeat && produced < count) {
+          out(produced) = v; produced += 1; k += 1
+        }
+      }
+    }
+    out
+  }
+
+  private def gzipDecompress(in: Array[Byte]): Array[Byte] = {
+    val gis =
+      new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(in))
+    try gis.readAllBytes()
+    finally gis.close()
+  }
+  private def zstdDecompress(in: Array[Byte], uncompressedLen: Int): Array[Byte] = {
+    val out = new Array[Byte](uncompressedLen)
+    new ZstdDecompressor().decompress(in, 0, in.length, out, 0, uncompressedLen)
+    out
+  }
+
+  private def decompress(
+      body: Array[Byte],
+      codec: Int,
+      uncompressedLen: Int
+  ): Array[Byte] = codec match {
+    case CODEC_UNCOMPRESSED => body
+    case CODEC_SNAPPY       => snappyDecompress(body, uncompressedLen)
+    case CODEC_GZIP         => gzipDecompress(body)
+    case CODEC_ZSTD         => zstdDecompress(body, uncompressedLen)
+    case other =>
+      throw new RuntimeException(
+        s"Unsupported Parquet compression codec $other. Supported: UNCOMPRESSED, SNAPPY, GZIP, ZSTD."
+      )
+  }
+
+  def readFooter(bytes: Array[Byte]): Footer = {
+    val footerLen = (bytes(bytes.length - 8) & 0xff) |
+      ((bytes(bytes.length - 7) & 0xff) << 8) |
+      ((bytes(bytes.length - 6) & 0xff) << 16) |
+      ((bytes(bytes.length - 5) & 0xff) << 24)
+    val footerStart = bytes.length - 8 - footerLen
+    val fr = new CReader(bytes); fr.pos = footerStart
+
+    var schema = Vector.empty[SchemaRaw]
+    val rowGroups =
+      scala.collection.mutable.ArrayBuffer.empty[Vector[PColMeta]]
+    val rowGroupRows = scala.collection.mutable.ArrayBuffer.empty[Int]
+    var last = 0; var done = false
+    while (!done) {
+      val (t, id) = fr.fieldHeader(last)
+      if (t == 0) done = true
+      else {
+        last = id
+        id match {
+          case 2 =>
+            val (sz, _) = fr.listHeader()
+            var i = 0
+            while (i < sz) {
+              var tp = -1; var rep = -1; var conv = -1; var nm = ""; var nch = 0
+              var l2 = 0; var d2 = false
+              while (!d2) {
+                val (ft, fid) = fr.fieldHeader(l2)
+                if (ft == 0) d2 = true
+                else {
+                  l2 = fid
+                  fid match {
+                    case 1 => tp = fr.readI32()
+                    case 3 => rep = fr.readI32()
+                    case 4 => nm = new String(fr.readBinary(), "UTF-8")
+                    case 5 => nch = fr.readI32()
+                    case 6 => conv = fr.readI32()
+                    case _ => fr.skip(ft)
+                  }
+                }
+              }
+              schema =
+                schema :+ SchemaRaw(nm, rep, if (tp >= 0) Some(tp) else None, conv, nch)
+              i += 1
+            }
+          case 4 =>
+            val (sz, _) = fr.listHeader()
+            var i = 0
+            while (i < sz) {
+              val cols = scala.collection.mutable.ArrayBuffer.empty[PColMeta]
+              var rgRows = 0
+              var l2 = 0; var d2 = false
+              while (!d2) {
+                val (ft, fid) = fr.fieldHeader(l2)
+                if (ft == 0) d2 = true
+                else {
+                  l2 = fid
+                  fid match {
+                    case 3 => rgRows = fr.readI64().toInt
+                    case 1 =>
+                      val (csz, _) = fr.listHeader()
+                      var j = 0
+                      while (j < csz) {
+                        var nm = ""; var tp = -1; var codec = 0; var nv = 0L
+                        var path = Vector.empty[String]
+                        var dpo = 0L; var dicto = -1L; var tc = 0L
+                        var nullCount = -1L
+                        var minV: Option[Array[Byte]] = None
+                        var maxV: Option[Array[Byte]] = None
+                        var minD: Option[Array[Byte]] = None
+                        var maxD: Option[Array[Byte]] = None
+                        var l3 = 0; var d3 = false
+                        while (!d3) {
+                          val (ct, cid) = fr.fieldHeader(l3)
+                          if (ct == 0) d3 = true
+                          else {
+                            l3 = cid
+                            cid match {
+                              case 3 =>
+                                var l4 = 0; var d4 = false
+                                while (!d4) {
+                                  val (mt, mid) = fr.fieldHeader(l4)
+                                  if (mt == 0) d4 = true
+                                  else {
+                                    l4 = mid
+                                    mid match {
+                                      case 1 => tp = fr.readI32()
+                                      case 3 =>
+                                        val (psz, _) = fr.listHeader()
+                                        var k = 0
+                                        while (k < psz) {
+                                          val s = new String(fr.readBinary(), "UTF-8")
+                                          path = path :+ s
+                                          nm = s
+                                          k += 1
+                                        }
+                                      case 4  => codec = fr.readI32()
+                                      case 5  => nv = fr.readI64()
+                                      case 9  => dpo = fr.readI64()
+                                      case 11 => dicto = fr.readI64()
+                                      case 7  => tc = fr.readI64()
+                                      case 12 =>
+                                        var l5 = 0; var d5 = false
+                                        while (!d5) {
+                                          val (st, sid) = fr.fieldHeader(l5)
+                                          if (st == 0) d5 = true
+                                          else {
+                                            l5 = sid
+                                            sid match {
+                                              case 1 => maxD = Some(fr.readBinary())
+                                              case 2 => minD = Some(fr.readBinary())
+                                              case 3 => nullCount = fr.readI64()
+                                              case 5 => maxV = Some(fr.readBinary())
+                                              case 6 => minV = Some(fr.readBinary())
+                                              case _ => fr.skip(st)
+                                            }
+                                          }
+                                        }
+                                      case _  => fr.skip(mt)
+                                    }
+                                  }
+                                }
+                              case _ => fr.skip(ct)
+                            }
+                          }
+                        }
+                        val sc = schema.find(_.name == nm)
+                        val convFor = sc.map(_.convertedType).getOrElse(-1)
+                        val repFor = sc.map(_.repetition).getOrElse(0)
+                        cols += PColMeta(nm, tp, convFor, codec, nv, dpo, dicto, tc,
+                          repFor == REP_OPTIONAL, nullCount, minV.orElse(minD),
+                          maxV.orElse(maxD), path)
+                        j += 1
+                      }
+                    case _ => fr.skip(ft)
+                  }
+                }
+              }
+              rowGroups += cols.toVector
+              rowGroupRows += rgRows
+              i += 1
+            }
+          case _ => fr.skip(t)
+        }
+      }
+    }
+
+    Footer(rowGroups.toVector, rowGroupRows.toVector, schema)
+  }
+
+  private def readPageHeader(r: CReader): PageHeader = {
+    val h = new PageHeader(-1, 0, 0, 0, 0, 0)
+    var l = 0; var d = false
+    while (!d) {
+      val (t, id) = r.fieldHeader(l)
+      if (t == 0) d = true
+      else {
+        l = id
+        id match {
+          case 1 => h.pType = r.readI32()
+          case 2 => h.ups = r.readI32()
+          case 3 => h.cps = r.readI32()
+          case 5 =>
+            var l2 = 0; var d2 = false
+            while (!d2) {
+              val (ft, fid) = r.fieldHeader(l2)
+              if (ft == 0) d2 = true
+              else {
+                l2 = fid
+                fid match {
+                  case 1 => h.dpNum = r.readI32()
+                  case 2 => h.dpEnc = r.readI32()
+                  case _ => r.skip(ft)
+                }
+              }
+            }
+          case 7 =>
+            var l2 = 0; var d2 = false
+            while (!d2) {
+              val (ft, fid) = r.fieldHeader(l2)
+              if (ft == 0) d2 = true
+              else {
+                l2 = fid
+                fid match {
+                  case 1 => h.dictNum = r.readI32()
+                  case _ => r.skip(ft)
+                }
+              }
+            }
+          case _ => r.skip(t)
+        }
+      }
+    }
+    h
+  }
+
+  private def decodeFlatPage(
+      body: Array[Byte],
+      dpNum: Int,
+      dpEnc: Int,
+      maxDef: Int,
+      acc: ColAcc
+  ): Unit = {
+    val dr = new CReader(body)
+    val defLevels =
+      if (maxDef > 0) {
+        val len = dr.le32At(dr.pos); dr.pos += 4
+        val end = dr.pos + len
+        val dl = readRleBitpack(dr, 1, dpNum, end)
+        dr.pos = end
+        dl
+      } else null
+    if (dpEnc == ENC_PLAIN) {
+      var di = 0
+      while (di < dpNum) {
+        if (maxDef == 0 || defLevels(di) == 1) acc.addPlain(dr) else acc.addNull()
+        di += 1
+      }
+    } else if (dpEnc == ENC_PLAIN_DICTIONARY || dpEnc == ENC_RLE_DICTIONARY) {
+      val present = if (maxDef > 0) defLevels.count(_ == 1) else dpNum
+      val bw = dr.u8()
+      val idx = readRleBitpack(dr, bw, present, body.length)
+      var di = 0; var p = 0
+      while (di < dpNum) {
+        if (maxDef == 0 || defLevels(di) == 1) { acc.addDict(idx(p)); p += 1 }
+        else acc.addNull()
+        di += 1
+      }
+    } else
+      throw new RuntimeException(
+        s"Unsupported Parquet data page encoding $dpEnc. Supported: PLAIN, PLAIN_DICTIONARY, RLE_DICTIONARY. DELTA_* and BYTE_STREAM_SPLIT are not supported."
+      )
+  }
+
+  private def decodeFlatInto(
+      bytes: Array[Byte],
+      start: Int,
+      endOfChunk: Int,
+      codec: Int,
+      optional: Boolean,
+      numValues: Long,
+      acc: ColAcc
+  ): Unit = {
+    val r = new CReader(bytes); r.pos = start
+    var hasDict = false
+    var remaining = numValues
+    val maxDef = if (optional) 1 else 0
+    while (r.pos < endOfChunk && (remaining > 0 || !hasDict)) {
+      val h = readPageHeader(r)
+      val pageData = java.util.Arrays.copyOfRange(bytes, r.pos, r.pos + h.cps)
+      r.pos += h.cps
+      val body = decompress(pageData, codec, h.ups)
+      if (h.pType == PAGE_DICTIONARY) {
+        acc.loadDict(new CReader(body), h.dictNum); hasDict = true
+      } else if (h.pType == PAGE_DATA) {
+        decodeFlatPage(body, h.dpNum, h.dpEnc, maxDef, acc)
+        remaining -= h.dpNum
+      } else
+        throw new RuntimeException(
+          s"Unsupported Parquet page type ${h.pType}. DATA_PAGE_V2 and index pages are not supported."
+        )
+    }
+  }
+
+  private def readPageHeaderStream(s: SReader): PageHeader = {
+    val h = new PageHeader(-1, 0, 0, 0, 0, 0)
+    var l = 0; var d = false
+    while (!d) {
+      val (t, id) = s.fieldHeader(l)
+      if (t == 0) d = true
+      else {
+        l = id
+        id match {
+          case 1 => h.pType = s.readI32()
+          case 2 => h.ups = s.readI32()
+          case 3 => h.cps = s.readI32()
+          case 5 =>
+            var l2 = 0; var d2 = false
+            while (!d2) {
+              val (ft, fid) = s.fieldHeader(l2)
+              if (ft == 0) d2 = true
+              else {
+                l2 = fid
+                fid match {
+                  case 1 => h.dpNum = s.readI32()
+                  case 2 => h.dpEnc = s.readI32()
+                  case _ => s.skip(ft)
+                }
+              }
+            }
+          case 7 =>
+            var l2 = 0; var d2 = false
+            while (!d2) {
+              val (ft, fid) = s.fieldHeader(l2)
+              if (ft == 0) d2 = true
+              else {
+                l2 = fid
+                fid match {
+                  case 1 => h.dictNum = s.readI32()
+                  case _ => s.skip(ft)
+                }
+              }
+            }
+          case _ => s.skip(t)
+        }
+      }
+    }
+    h
+  }
+
+  def decodeColumnChunk(chunkBytes: Array[Byte], cm: PColMeta): ReadColumn = {
+    val acc = ColAcc.of(cm.ptype)
+    decodeFlatInto(chunkBytes, 0, chunkBytes.length, cm.codec, cm.optional, cm.numValues, acc)
+    acc.build(cm.name, cm.convertedType)
+  }
+
+  def decodeChunkPages(in: InputStream, cm: PColMeta)(onPage: ReadColumn => Unit): Unit = {
+    val s = new SReader(in)
+    val acc = ColAcc.of(cm.ptype)
+    val maxDef = if (cm.optional) 1 else 0
+    var remaining = cm.numValues
+    while (remaining > 0) {
+      val h = readPageHeaderStream(s)
+      val body = decompress(s.readFully(h.cps), cm.codec, h.ups)
+      if (h.pType == PAGE_DICTIONARY) acc.loadDict(new CReader(body), h.dictNum)
+      else if (h.pType == PAGE_DATA) {
+        decodeFlatPage(body, h.dpNum, h.dpEnc, maxDef, acc)
+        onPage(acc.emitReset(cm.name, cm.convertedType))
+        remaining -= h.dpNum
+      } else
+        throw new RuntimeException(
+          s"Unsupported Parquet page type ${h.pType}. DATA_PAGE_V2 and index pages are not supported."
+        )
+    }
+  }
+
+  def readFile(bytes: Array[Byte]): Vector[ReadColumn] = {
+    val footer = readFooter(bytes)
+    footer.requireFlat()
+    footer.rowGroups.head.map { headCm =>
+      val acc = ColAcc.of(headCm.ptype)
+      footer.rowGroups.foreach { rg =>
+        val cm = rg.find(_.name == headCm.name).get
+        val start =
+          (if (cm.dictPageOffset >= 0) cm.dictPageOffset else cm.dataPageOffset).toInt
+        decodeFlatInto(bytes, start, start + cm.totalCompressed.toInt, cm.codec,
+          cm.optional, cm.numValues, acc)
+      }
+      acc.build(headCm.name, headCm.convertedType)
+    }.toVector
+  }
+
+  def assembleAuto(bytes: Array[Byte]): Vector[ReadColumn] =
+    Unnest.assembleAuto(bytes)
+
+  private[parquet] def bitWidth(maxLevel: Int): Int = {
+    if (maxLevel <= 0) 0
+    else { var b = 0; var x = maxLevel; while (x > 0) { b += 1; x >>= 1 }; b }
+  }
+
+  private[parquet] def decodeNested(
+      bytes: Array[Byte],
+      start: Int,
+      endOfChunk: Int,
+      codec: Int,
+      ptype: Int,
+      numValues: Long,
+      maxRep: Int,
+      maxDef: Int
+  ): NestedChunk = {
+    val r = new CReader(bytes); r.pos = start
+    val acc = ColAcc.of(ptype)
+    val repB = new ArrayBuilder.ofInt
+    val defB = new ArrayBuilder.ofInt
+    var hasDict = false
+    var remaining = numValues
+    val repBW = bitWidth(maxRep)
+    val defBW = bitWidth(maxDef)
+    while (r.pos < endOfChunk && (remaining > 0 || !hasDict)) {
+      val h = readPageHeader(r)
+      val pageData = java.util.Arrays.copyOfRange(bytes, r.pos, r.pos + h.cps)
+      r.pos += h.cps
+      val body = decompress(pageData, codec, h.ups)
+      if (h.pType == PAGE_DICTIONARY) {
+        acc.loadDict(new CReader(body), h.dictNum); hasDict = true
+      } else if (h.pType == PAGE_DATA) {
+        val dr = new CReader(body)
+        val repLevels =
+          if (maxRep > 0) {
+            val len = dr.le32At(dr.pos); dr.pos += 4
+            val end = dr.pos + len
+            val rl = readRleBitpack(dr, repBW, h.dpNum, end)
+            dr.pos = end
+            rl
+          } else null
+        val defLevels =
+          if (maxDef > 0) {
+            val len = dr.le32At(dr.pos); dr.pos += 4
+            val end = dr.pos + len
+            val dl = readRleBitpack(dr, defBW, h.dpNum, end)
+            dr.pos = end
+            dl
+          } else null
+        val present = if (maxDef > 0) defLevels.count(_ == maxDef) else h.dpNum
+        if (h.dpEnc == ENC_PLAIN) {
+          var i = 0
+          while (i < h.dpNum) {
+            if (maxDef == 0 || defLevels(i) == maxDef) acc.addPlain(dr) else acc.addNull()
+            repB += (if (maxRep > 0) repLevels(i) else 0)
+            defB += (if (maxDef > 0) defLevels(i) else 0)
+            i += 1
+          }
+        } else if (h.dpEnc == ENC_PLAIN_DICTIONARY || h.dpEnc == ENC_RLE_DICTIONARY) {
+          val bw = dr.u8()
+          val idx = readRleBitpack(dr, bw, present, body.length)
+          var i = 0; var p = 0
+          while (i < h.dpNum) {
+            if (maxDef == 0 || defLevels(i) == maxDef) { acc.addDict(idx(p)); p += 1 }
+            else acc.addNull()
+            repB += (if (maxRep > 0) repLevels(i) else 0)
+            defB += (if (maxDef > 0) defLevels(i) else 0)
+            i += 1
+          }
+        } else
+          throw new RuntimeException(
+            s"Unsupported Parquet data page encoding ${h.dpEnc}."
+          )
+        remaining -= h.dpNum
+      } else
+        throw new RuntimeException(s"Unsupported Parquet page type ${h.pType}.")
+    }
+    new NestedChunk(repB.result(), defB.result(), acc.build("", -1))
+  }
+
+  def readFooter(source: SeekableByteChannel): Footer = {
+    val size = source.size()
+    val last8 = readAt(source, size - 8, 8)
+    val footerLen = (last8(0) & 0xff) | ((last8(1) & 0xff) << 8) |
+      ((last8(2) & 0xff) << 16) | ((last8(3) & 0xff) << 24)
+    readFooter(readAt(source, size - 8 - footerLen, 8 + footerLen))
+  }
+
+  private def readAt(source: SeekableByteChannel, pos: Long, len: Int): Array[Byte] = {
+    source.position(pos)
+    val bb = ByteBuffer.allocate(len)
+    while (bb.hasRemaining) {
+      val r = source.read(bb)
+      if (r < 0) throw new RuntimeException("unexpected end of parquet file")
+    }
+    bb.array()
+  }
+
+  def streamColumnChunk(source: SeekableByteChannel, cm: PColMeta)(
+      onPage: ReadColumn => Unit
+  ): Unit = {
+    val start = if (cm.dictPageOffset >= 0) cm.dictPageOffset else cm.dataPageOffset
+    source.position(start)
+    val in = new java.io.BufferedInputStream(Channels.newInputStream(source), 1 << 16)
+    decodeChunkPages(in, cm)(onPage)
+  }
+
+  def statValue(ptype: Int, bytes: Array[Byte]): Any = ptype match {
+    case TYPE_INT32 =>
+      (bytes(0) & 0xff) | ((bytes(1) & 0xff) << 8) |
+        ((bytes(2) & 0xff) << 16) | ((bytes(3) & 0xff) << 24)
+    case TYPE_INT64 =>
+      var v = 0L; var k = 0
+      while (k < 8) { v |= (bytes(k) & 0xffL) << (8 * k); k += 1 }
+      v
+    case TYPE_FLOAT =>
+      var bits = 0; var k = 0
+      while (k < 4) { bits |= (bytes(k) & 0xff) << (8 * k); k += 1 }
+      java.lang.Float.intBitsToFloat(bits).toDouble
+    case TYPE_DOUBLE =>
+      var b = 0L; var k = 0
+      while (k < 8) { b |= (bytes(k) & 0xffL) << (8 * k); k += 1 }
+      java.lang.Double.longBitsToDouble(b)
+    case TYPE_BYTE_ARRAY => new String(bytes, "UTF-8")
+    case other =>
+      throw new RuntimeException(s"unsupported statistic type $other")
+  }
+}
