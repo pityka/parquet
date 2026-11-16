@@ -1,5 +1,6 @@
 inThisBuild(
   List(
+    ThisBuild / dynverSeparator := "-",
     organization := "io.github.pityka",
     homepage := Some(url("https://github.com/pityka/parquet")),
     licenses := List(("MIT", url("https://opensource.org/licenses/MIT"))),
