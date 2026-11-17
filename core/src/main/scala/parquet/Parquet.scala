@@ -755,6 +755,32 @@ object Parquet extends ParquetReader {
     acc.build(cm.name, cm.convertedType)
   }
 
+  def decodeColumnChunk(
+      chunkBytes: Array[Byte],
+      cm: PColMeta,
+      maxRep: Int,
+      maxDef: Int
+  ): ReadColumn =
+    if (maxRep == 0 && maxDef <= 1) decodeColumnChunk(chunkBytes, cm)
+    else
+      renameColumn(
+        decodeNested(chunkBytes, 0, chunkBytes.length, cm.codec, cm.ptype,
+          cm.numValues, maxRep, maxDef).values,
+        cm.name,
+        cm.convertedType
+      )
+
+  private def renameColumn(
+      rc: ReadColumn,
+      name: String,
+      convertedType: Int
+  ): ReadColumn = rc match {
+    case c: ReadColumn.Ints    => c.copy(name = name, convertedType = convertedType)
+    case c: ReadColumn.Longs   => c.copy(name = name, convertedType = convertedType)
+    case c: ReadColumn.Doubles => c.copy(name = name, convertedType = convertedType)
+    case c: ReadColumn.Strings => c.copy(name = name, convertedType = convertedType)
+  }
+
   def decodeChunkPages(in: InputStream, cm: PColMeta)(onPage: ReadColumn => Unit): Unit = {
     val s = new SReader(in)
     val acc = ColAcc.of(cm.ptype)
@@ -790,6 +816,8 @@ object Parquet extends ParquetReader {
       acc.build(headCm.name, headCm.convertedType)
     }.toVector
   }
+
+  def leaves(root: SchemaNode): Vector[LeafInfo] = Unnest.leaves(root)
 
   def assembleAuto(bytes: Array[Byte]): Vector[ReadColumn] =
     Unnest.assembleAuto(bytes)

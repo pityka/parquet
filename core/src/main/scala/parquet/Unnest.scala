@@ -2,15 +2,26 @@ package parquet
 
 import Parquet.*
 
-private[parquet] object Unnest {
-
-  final case class SchemaNode(
+final case class SchemaNode(
       name: String,
       repetition: Int,
       ptype: Option[Int],
       convertedType: Int,
       children: Vector[SchemaNode]
-  )
+)
+
+final case class LeafInfo(
+    path: Vector[String],
+    ptype: Int,
+    convertedType: Int,
+    maxRep: Int,
+    maxDef: Int,
+    elementExistsLevel: Int
+)
+
+private[parquet] object Unnest {
+
+  
 
   def buildTree(schema: Vector[SchemaRaw]): SchemaNode = {
     var idx = 0
@@ -22,14 +33,7 @@ private[parquet] object Unnest {
     build()
   }
 
-  final case class LeafInfo(
-      path: Vector[String],
-      ptype: Int,
-      convertedType: Int,
-      maxRep: Int,
-      maxDef: Int,
-      elementExistsLevel: Int
-  )
+
 
   def leaves(root: SchemaNode): Vector[LeafInfo] = {
     val acc = scala.collection.mutable.ArrayBuffer.empty[LeafInfo]
