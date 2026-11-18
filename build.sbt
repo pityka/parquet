@@ -21,8 +21,6 @@ ThisBuild / scalaVersion := scalaVersion3
 
 ThisBuild / versionScheme := Some("early-semver")
 
-ThisBuild / versionPolicyIntention := Compatibility.None
-
 ThisBuild / publishTo := {
   val centralSnapshots =
     "https://central.sonatype.com/repository/maven-snapshots/"
