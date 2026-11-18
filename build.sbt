@@ -21,9 +21,14 @@ ThisBuild / scalaVersion := scalaVersion3
 
 ThisBuild / versionScheme := Some("early-semver")
 
-ThisBuild / publishTo := Some(
-  "GitHub Packages" at "https://maven.pkg.github.com/pityka/parquet"
-)
+ThisBuild / versionPolicyIntention := Compatibility.None
+
+ThisBuild / publishTo := {
+  val centralSnapshots =
+    "https://central.sonatype.com/repository/maven-snapshots/"
+  if (isSnapshot.value) Some("central-snapshots" at centralSnapshots)
+  else localStaging.value
+}
 
 ThisBuild / credentials ++= {
   for {
@@ -52,6 +57,8 @@ lazy val commonSettings = Seq(
     "-Werror"
   ),
   Compile / console / scalacOptions ~= (_.filterNot(_ == "-Werror")),
+  Compile / doc / scalacOptions ~= (_.filterNot(_ == "-Werror")),
+  Compile / doc / sources := Seq.empty,
   Global / cancelable := true,
   fork := true
 )

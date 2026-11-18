@@ -4,7 +4,42 @@ on:
     branches: [master, main]
     tags: ["*"]
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: sbt/setup-sbt@v1
+      - run: sbt -J-Xmx3000m test
+
+  publish-central:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: sbt/setup-sbt@v1
+      - uses: olafurpg/setup-gpg@v3
+      - name: Publish to Maven Central
+        run: sbt versionCheck ci-release
+        env:
+          PGP_PASSPHRASE: ${{ secrets.PGP_PASSPHRASE }}
+          PGP_SECRET: ${{ secrets.PGP_SECRET }}
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+
   publish-ghp:
+    needs: [test]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -19,7 +54,9 @@ jobs:
           java-version: 17
       - uses: sbt/setup-sbt@v1
       - name: Publish to GitHub Packages
-        run: sbt test publish
+        run: |
+          sbt 'set ThisBuild / publishTo := Some("GitHub Packages" at "https://maven.pkg.github.com/pityka/parquet")' \
+              publish
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
