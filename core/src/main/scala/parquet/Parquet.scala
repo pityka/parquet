@@ -817,6 +817,8 @@ object Parquet extends ParquetReader {
     }.toVector
   }
 
+  def buildTree(schema: Vector[SchemaRaw]): SchemaNode = Unnest.buildTree(schema)
+
   def leaves(root: SchemaNode): Vector[LeafInfo] = Unnest.leaves(root)
 
   def assembleAuto(bytes: Array[Byte]): Vector[ReadColumn] =
